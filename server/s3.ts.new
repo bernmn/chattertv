@@ -1,0 +1,88 @@
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import fs from 'fs';
+import path from 'path';
+import { Readable } from 'stream';
+
+// S3 has been disabled as per user request
+// A simplified check that always returns false to use local storage
+const checkS3Configuration = () => {
+  console.log('=== S3 Configuration Check ===');
+  console.log('S3 integration is DISABLED in this version');
+  console.log('Using local file storage only');
+  return false;
+};
+
+// This will always be false since the check above always returns false
+export const USE_S3 = checkS3Configuration(); 
+
+// Create a dummy S3 client that will never be used
+export const s3Client = USE_S3 ? new S3Client({
+  region: process.env.AWS_REGION || '',
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+  }
+}) : null;
+
+const bucket = USE_S3 ? process.env.AWS_S3_BUCKET || '' : '';
+
+// All S3 operations are stubbed to return appropriate error messages
+export async function uploadFileToS3() {
+  console.log('S3 integration disabled - uploadFileToS3 not available');
+  throw new Error('S3 integration is disabled in this version');
+}
+
+export async function generatePresignedUploadUrl() {
+  console.log('S3 integration disabled - generatePresignedUploadUrl not available');
+  throw new Error('S3 integration is disabled in this version');
+}
+
+export async function getPresignedUrl() {
+  console.log('S3 integration disabled - getPresignedUrl not available');
+  throw new Error('S3 integration is disabled in this version');
+}
+
+export async function downloadFileFromS3() {
+  console.log('S3 integration disabled - downloadFileFromS3 not available');
+  throw new Error('S3 integration is disabled in this version');
+}
+
+export async function deleteFileFromS3() {
+  console.log('S3 integration disabled - deleteFileFromS3 not available');
+  throw new Error('S3 integration is disabled in this version');
+}
+
+export function getS3KeyFromUrl() {
+  console.log('S3 integration disabled - getS3KeyFromUrl not available');
+  throw new Error('S3 integration is disabled in this version');
+}
+
+export async function fileExistsInS3() {
+  console.log('S3 integration disabled - fileExistsInS3 not available');
+  return false;
+}
+
+export function getS3Url() {
+  console.log('S3 integration disabled - getS3Url not available');
+  throw new Error('S3 integration is disabled in this version');
+}
+
+export function isValidUrl(urlString: string): boolean {
+  try {
+    new URL(urlString);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function normalizeS3Key(path: string): string {
+  // Remove leading slash if present
+  return path.startsWith('/') ? path.substring(1) : path;
+}
+
+export async function getProperAssetUrl() {
+  // Always return empty string as S3 is disabled
+  return '';
+}

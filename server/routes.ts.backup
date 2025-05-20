@@ -1,0 +1,770 @@
+import express, { type Express, Request, Response, NextFunction } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { insertVideoSchema, insertCommentSchema } from "@shared/schema";
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import { randomUUID } from "crypto";
+import { z } from "zod";
+import { fromZodError } from "zod-validation-error";
+import { exec } from "child_process";
+
+// Set up storage for uploaded files
+const uploadDir = path.join(process.cwd(), "uploads");
+const thumbnailDir = path.join(process.cwd(), "thumbnails");
+
+// Log paths for debugging
+console.log('Upload directory:', uploadDir);
+console.log('Thumbnail directory:', thumbnailDir);
+
+// Helper function to generate a thumbnail from a video using ffmpeg
+function generateThumbnail(videoPath: string, thumbnailPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    // Extract thumbnail at 1 second mark
+    const command = `ffmpeg -i "${videoPath}" -ss 00:00:01.000 -vframes 1 "${thumbnailPath}" -y`;
+    
+    exec(command, (error) => {
+      if (error) {
+        console.error(`Error generating thumbnail: ${error.message}`);
+        resolve(false);
+      } else {
+        resolve(true);
+      }
+    });
+  });
+}
+
+// Ensure upload directories exist
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+if (!fs.existsSync(thumbnailDir)) {
+  fs.mkdirSync(thumbnailDir, { recursive: true });
+}
+
+// Get file size limit from environment variable or use default (200MB)
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || '209715200'); // Exactly 200MB in bytes (200 * 1024 * 1024)
+const TEST_FILE_SIZE = MAX_FILE_SIZE + (100 * 1024 * 1024); // Add 100MB buffer for test endpoints
+
+// Configure multer for file uploads
+const storage_config = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueFilename = `${randomUUID()}${path.extname(file.originalname)}`;
+    cb(null, uniqueFilename);
+  }
+});
+
+// Create a multer configuration with appropriate settings for handling larger files
+const upload = multer({ 
+  storage: storage_config,
+  limits: { 
+    fileSize: MAX_FILE_SIZE,      // Use environment variable or default
+    fieldSize: 25 * 1024 * 1024,  // Increase field size limit
+    files: 1,                     // Only allow one file per request
+    parts: 10                     // Limit number of parts in request
+  },
+  fileFilter: (req, file, cb) => {
+    // Allow video files - be more accepting of different formats/MIME types
+    const filetypes = /mp4|mov|avi|webm|mkv|flv|wmv|ogg|3gp/;
+    
+    // Check for video/ mimetype or known extensions
+    const isVideoMimetype = file.mimetype.startsWith('video/');
+    const hasVideoExtension = filetypes.test(path.extname(file.originalname).toLowerCase());
+    
+    console.log(`File upload attempt: ${file.originalname} (${file.mimetype})`);
+    console.log(`    File size information not available at filter stage`);
+    
+    if (isVideoMimetype || hasVideoExtension) {
+      console.log(`Video file accepted: ${file.originalname}`);
+      return cb(null, true);
+    }
+    
+    console.log(`File rejected (not a video): ${file.originalname}`);
+    cb(new Error("Error: Only video files are allowed!"));
+  }
+});
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Create a separate multer instance with an even higher size limit for testing (memory-based)
+  const testUpload = multer({
+    storage: multer.memoryStorage(), // Use memory storage to avoid saving files
+    limits: { fileSize: TEST_FILE_SIZE }, // Test size limit (MAX_FILE_SIZE + 100MB)
+  });
+  
+  // Setup a separate multer instance for disk-based test endpoint
+  const testDiskUpload = multer({
+    dest: path.join(process.cwd(), 'test-uploads'), // Save to test-uploads directory
+    limits: { fileSize: TEST_FILE_SIZE }, // Test size limit (MAX_FILE_SIZE + 100MB)
+  });
+  
+  // This endpoint is permanently disabled as AWS S3 is not used in this application
+  app.get('/api/upload-url', async (req: Request, res: Response) => {
+    // Return a clear error message that S3 is completely disabled, with no fallback
+    console.log('S3 direct upload endpoint accessed - permanently disabled');
+    return res.status(400).json({
+      error: "S3 functionality disabled",
+      message: "This application uses local file storage only. Please use the standard upload endpoint.",
+      fallbackAvailable: false
+    });
+  });
+  
+  // Endpoint to handle S3 uploads is permanently disabled in this application
+  app.post('/api/videos/s3', async (req: Request, res: Response) => {
+    // Return a clear error message that S3 is completely disabled, with no fallback
+    console.log('S3 upload endpoint accessed - permanently disabled');
+    return res.status(400).json({
+      error: "S3 functionality disabled",
+      message: "This application uses local file storage only. Please use the standard upload endpoint.",
+      fallbackAvailable: false
+    });
+  });
+  
+  // Add a test endpoint for file size limits
+  app.post('/api/test/file-size', testUpload.single('testFile'), (req: Request, res: Response) => {
+    try {
+      console.log("📊 TEST FILE UPLOAD RECEIVED");
+      
+      if (!req.file) {
+        console.error("❌ Test upload failed: No file uploaded");
+        return res.status(400).json({ message: "No file uploaded" });
+      }
+      
+      const fileSize = req.file.size;
+      const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(2);
+      
+      console.log(`
+=========================================
+📈 TEST UPLOAD SUCCESSFUL
+=========================================
+📝 File name: ${req.file.originalname}
+📦 File size: ${fileSizeMB}MB (${fileSize} bytes)
+🔖 MIME type: ${req.file.mimetype}
+📂 Memory Storage Used (file not saved to disk)
+🕒 Timestamp: ${new Date().toISOString()}
+=========================================
+      `);
+      
+      // Note: We're using memory storage (multer.memoryStorage) so there's no file to delete
+      // The file is automatically discarded after the request
+      
+      return res.status(200).json({
+        message: "File size test successful",
+        fileDetails: {
+          name: req.file.originalname,
+          size: req.file.size,
+          sizeMB: parseFloat(fileSizeMB),
+          mimeType: req.file.mimetype,
+          timestamp: new Date().toISOString()
+        }
+      });
+    } catch (error) {
+      console.error("❌ ERROR PROCESSING TEST FILE:", error);
+      return res.status(500).json({ 
+        message: "File upload test failed", 
+        error: (error as Error).message,
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+  
+  // Add a disk-based test endpoint for file size limits
+  app.post('/api/test/file-size-disk', testDiskUpload.single('testFileDisk'), (req: Request, res: Response) => {
+    try {
+      console.log("📊 DISK-BASED TEST FILE UPLOAD RECEIVED");
+      
+      if (!req.file) {
+        console.error("❌ Disk test upload failed: No file uploaded");
+        return res.status(400).json({ message: "No file uploaded" });
+      }
+      
+      const fileSize = req.file.size;
+      const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(2);
+      
+      console.log(`
+=========================================
+📈 DISK-BASED TEST UPLOAD SUCCESSFUL
+=========================================
+📝 File name: ${req.file.originalname}
+📦 File size: ${fileSizeMB}MB (${fileSize} bytes)
+🔖 MIME type: ${req.file.mimetype}
+📂 Saved to disk at: ${req.file.path}
+🕒 Timestamp: ${new Date().toISOString()}
+=========================================
+      `);
+      
+      // Create the test-uploads directory if it doesn't exist
+      const testUploadsDir = path.join(process.cwd(), 'test-uploads');
+      if (!fs.existsSync(testUploadsDir)) {
+        fs.mkdirSync(testUploadsDir, { recursive: true });
+      }
+      
+      // Delete the test file after successful processing
+      try {
+        setTimeout(() => {
+          if (req.file?.path && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+            console.log(`🗑️ Test file deleted after delay: ${req.file.path}`);
+          }
+        }, 5000); // Delete after 5 seconds to allow for client to finish getting response
+      } catch (deleteError) {
+        console.error('Error scheduling file deletion:', deleteError);
+        // Continue - deletion failure is not critical
+      }
+      
+      return res.status(200).json({
+        message: "File size test successful (disk storage)",
+        fileDetails: {
+          name: req.file.originalname,
+          size: req.file.size,
+          sizeMB: parseFloat(fileSizeMB),
+          mimeType: req.file.mimetype,
+          path: req.file.path,
+          timestamp: new Date().toISOString()
+        }
+      });
+    } catch (error) {
+      console.error("❌ ERROR PROCESSING DISK TEST FILE:", error);
+      return res.status(500).json({ 
+        message: "File upload test failed", 
+        error: (error as Error).message,
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+  
+  // Serve static files from uploads, thumbnails, and public directories
+  app.use('/uploads', express.static(uploadDir));
+  app.use('/thumbnails', express.static(thumbnailDir));
+  app.use(express.static(path.join(process.cwd(), 'public')));
+  
+  // Thumbnail API endpoint - serves files from local storage only (AWS disconnected)
+  app.get('/thumbnails/api/:filename', async (req: Request, res: Response) => {
+    try {
+      const filename = req.params.filename;
+      console.log('Thumbnail API request for:', filename);
+      
+      // AWS is disconnected, so we'll only check local storage
+      
+      // Check if this file exists locally
+      const localPath = path.join(thumbnailDir, filename);
+      console.log('Checking local path:', localPath);
+      
+      if (fs.existsSync(localPath)) {
+        console.log('Found thumbnail locally, serving from:', localPath);
+        return res.sendFile(localPath);
+      }
+      
+      console.log('Thumbnail not found locally');
+      
+      // If we get here, the thumbnail wasn't found
+      console.error(`Thumbnail not found: ${filename}`);
+      
+      // Check if we have a missing thumbnail placeholder SVG
+      const missingThumbnailPathSvg = path.join(process.cwd(), 'public/missing-thumbnail.svg');
+      if (fs.existsSync(missingThumbnailPathSvg)) {
+        console.log('Serving missing thumbnail SVG placeholder');
+        return res.status(200).sendFile(missingThumbnailPathSvg);
+      }
+      
+      // Fallback to old jpg placeholder if SVG doesn't exist
+      const missingThumbnailPath = path.join(process.cwd(), 'public/missing-thumbnail.jpg');
+      if (fs.existsSync(missingThumbnailPath)) {
+        console.log('Serving missing thumbnail placeholder');
+        return res.status(200).sendFile(missingThumbnailPath);
+      }
+      
+      // No placeholder available
+      res.status(404).send('Thumbnail not found');
+    } catch (error) {
+      console.error('Error serving thumbnail:', error);
+      res.status(500).send('Error processing thumbnail request');
+    }
+  });
+  
+  // Video download endpoint (local files only - AWS disconnected)
+  app.get("/api/videos/:id/download", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id);
+      const video = await storage.getVideo(id);
+      
+      if (!video) {
+        return res.status(404).json({ message: "Video not found" });
+      }
+      
+      // Verify this is an AI video that should be downloadable
+      if (!video.isAI) {
+        console.warn(`Attempt to download non-AI video (id: ${id})`);
+        return res.status(403).json({ message: "Only AI-generated videos can be downloaded" });
+      }
+      
+      console.log(`Preparing download for video ${id}:`, video.filePath);
+      
+      // For local file storage or S3 fallback, use direct path in uploads folder
+      let filename = video.filePath;
+      
+      // If it's an S3 URL, extract just the filename
+      if (video.filePath.startsWith('https://')) {
+        const parts = video.filePath.split('/');
+        filename = parts[parts.length - 1].split('?')[0]; // Remove any query parameters
+      }
+      
+      const videoPath = path.join(process.cwd(), 'uploads', filename);
+      
+      if (!fs.existsSync(videoPath)) {
+        console.error(`Video file not found at: ${videoPath}`);
+        return res.status(404).json({ message: "Video file not found" });
+      }
+      
+      // Set headers for download
+      res.setHeader('Content-Disposition', `attachment; filename="${video.title || 'video.mp4'}"`);
+      res.setHeader('Content-Type', 'video/mp4');
+      
+      // Stream the file for download
+      console.log(`Serving local file for download: ${videoPath}`);
+      return res.sendFile(videoPath);
+    } catch (error) {
+      console.error("Error downloading video:", error);
+      res.status(500).json({ message: "Failed to download video" });
+    }
+  });
+
+  // Health check endpoint
+  app.get("/api/health", (req: Request, res: Response) => {
+    res.json({ status: "ok" });
+  });
+
+  // Video endpoints
+  app.get("/api/videos", async (req: Request, res: Response) => {
+    try {
+      const videos = await storage.getVideos();
+      res.json(videos);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch videos" });
+    }
+  });
+
+  app.get("/api/videos/recent", async (req: Request, res: Response) => {
+    try {
+      const limit = req.query.limit ? parseInt(req.query.limit as string) : 5;
+      const videos = await storage.getRecentVideos(limit);
+      res.json(videos);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch recent videos" });
+    }
+  });
+
+  app.get("/api/videos/featured", async (req: Request, res: Response) => {
+    try {
+      const limit = req.query.limit ? parseInt(req.query.limit as string) : 5;
+      const videos = await storage.getFeaturedVideos(limit);
+      res.json(videos);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch featured videos" });
+    }
+  });
+
+  app.get("/api/videos/contest", async (req: Request, res: Response) => {
+    try {
+      const limit = req.query.limit ? parseInt(req.query.limit as string) : 5;
+      const videos = await storage.getContestVideos(limit);
+      res.json(videos);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch contest videos" });
+    }
+  });
+  
+  app.get("/api/videos/ai", async (req: Request, res: Response) => {
+    try {
+      const limit = req.query.limit ? parseInt(req.query.limit as string) : 5;
+      const videos = await storage.getAIVideos(limit);
+      res.json(videos);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch AI videos" });
+    }
+  });
+
+  app.get("/api/videos/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id);
+      const video = await storage.getVideo(id);
+      
+      if (!video) {
+        return res.status(404).json({ message: "Video not found" });
+      }
+      
+      // Increment views when video is fetched
+      await storage.incrementViews(id);
+      
+      res.json(video);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch video" });
+    }
+  });
+
+  // Define custom error handler for multer
+  const uploadErrorHandler = (err: any, req: Request, res: Response, next: NextFunction) => {
+    console.error("❌ Upload error occurred:", err);
+    
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      console.error(`File size limit exceeded (max: ${MAX_FILE_SIZE/1024/1024}MB)`);
+      return res.status(413).json({
+        message: "File is too large",
+        error: `Maximum file size is ${MAX_FILE_SIZE/1024/1024}MB`,
+        code: "FILE_TOO_LARGE",
+        maxSizeBytes: MAX_FILE_SIZE,
+        maxSizeMB: MAX_FILE_SIZE/1024/1024
+      });
+    }
+    
+    if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+      console.error("Unexpected field in upload request");
+      return res.status(400).json({
+        message: "Unexpected field in upload request",
+        error: "The form contains an invalid field",
+        code: "INVALID_FIELD", 
+        tip: "Make sure the file field is named 'video'"
+      });
+    }
+    
+    // Handle generic multer errors
+    console.error("Generic upload error:", err.message);
+    return res.status(500).json({
+      message: "File upload failed",
+      error: err.message || "Unknown upload error",
+      code: "UPLOAD_FAILED"
+    });
+  };
+  
+  // Video upload endpoint with optimized error handling for larger files
+  app.post("/api/videos", (req: Request, res: Response, next: NextFunction) => {
+    console.log("📤 Standard video upload endpoint called");
+    
+    // Use multer upload with custom error handling
+    upload.single("video")(req, res, (err) => {
+      if (err) {
+        return uploadErrorHandler(err, req, res, next);
+      }
+      
+      // Continue to actual handler if no multer errors
+      processVideoUpload(req, res).catch(next);
+    });
+  });
+  
+  // Separate function to process the upload after multer has handled the file
+  async function processVideoUpload(req: Request, res: Response) {
+    try {
+      console.log("🎬 Processing video upload");
+      
+      if (!req.file) {
+        console.error("❌ No file in request - upload failed");
+        return res.status(400).json({ 
+          message: "No video file uploaded", 
+          error: "Missing file attachment",
+          code: "MISSING_FILE",
+          tip: "Make sure the file is included in the FormData with the key 'video'"
+        });
+      }
+      
+      console.log(`Processing uploaded file: ${req.file.originalname} (${req.file.size} bytes, ${req.file.mimetype})`);
+      
+
+      // Get local paths
+      const filename = path.basename(req.file.path);
+      const videoFullPath = req.file.path;
+      
+      // Generate thumbnail filename and path
+      const thumbnailFilename = `thumbnail-${randomUUID()}.jpg`;
+      const thumbnailFullPath = path.join(thumbnailDir, thumbnailFilename);
+      
+      // Generate thumbnail from the uploaded video
+      const thumbnailSuccess = await generateThumbnail(videoFullPath, thumbnailFullPath);
+      if (!thumbnailSuccess) {
+        console.warn("Failed to generate thumbnail, using video without thumbnail");
+      }
+      
+      // Default to local paths
+      let videoPath = filename;
+      let thumbnailPath = thumbnailFilename;
+      
+      // AWS is disconnected - use local storage only
+      console.log('AWS disconnected, using local storage only.');
+      // Video and thumbnail paths are already set to local paths
+      
+      console.log('Final video path:', videoPath);
+      console.log('Final thumbnail path:', thumbnailPath);
+      
+      // Parse boolean flags from form data strings
+      const isContest = req.body.isContest === "true";
+      const isAI = req.body.isAI === "true";
+      console.log("Creating video with isContest:", isContest, "isAI:", isAI);
+      
+      // Use Zod to validate request body
+      const validatedData = insertVideoSchema.parse({
+        title: req.body.title,
+        description: req.body.description || "",
+        duration: parseInt(req.body.duration || "0"),
+        filePath: videoPath,
+        thumbnailPath: thumbnailPath,
+        category: req.body.category || "",
+        tags: req.body.tags ? req.body.tags.split(",") : [],
+        isFeatured: req.body.isFeatured === "true",
+        isContest: isContest,
+        isAI: isAI,
+        userId: 1 // Default to demo user for now (in a real app, would be from auth)
+      });
+      
+      const video = await storage.createVideo(validatedData);
+      
+      // No need to clean up local files - we keep them as backups 
+      // even when S3 upload succeeds for additional redundancy
+      
+      res.status(201).json(video);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        const validationError = fromZodError(error);
+        return res.status(400).json({ message: validationError.message });
+      }
+      
+      console.error("Error uploading video:", error);
+      res.status(500).json({ message: "Failed to upload video" });
+    }
+  }
+
+  app.delete("/api/videos/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id);
+      const video = await storage.getVideo(id);
+      
+      if (!video) {
+        return res.status(404).json({ message: "Video not found" });
+      }
+      
+      // AWS is disconnected - only handle local file deletion
+      
+      // Delete the video file from local storage
+      try {
+        // Extract just the filename
+        const filename = path.basename(video.filePath);
+        const fullFilePath = path.join(uploadDir, filename);
+        
+        if (fs.existsSync(fullFilePath)) {
+          fs.unlinkSync(fullFilePath);
+          console.log('Deleted video file from local storage:', fullFilePath);
+        } else {
+          console.warn('Video file not found in local storage at path:', fullFilePath);
+        }
+      } catch (fileError) {
+        console.error('Error deleting video file:', fileError);
+        // Continue with deletion even if file delete fails
+      }
+      
+      // Delete the thumbnail file from local storage
+      try {
+        // Extract just the filename
+        const filename = path.basename(video.thumbnailPath);
+        const fullThumbnailPath = path.join(thumbnailDir, filename);
+        
+        if (fs.existsSync(fullThumbnailPath)) {
+          fs.unlinkSync(fullThumbnailPath);
+          console.log('Deleted thumbnail file from local storage:', fullThumbnailPath);
+        } else {
+          console.warn('Thumbnail file not found in local storage at path:', fullThumbnailPath);
+        }
+      } catch (thumbError) {
+        console.error('Error deleting thumbnail file:', thumbError);
+        // Continue with deletion even if thumbnail delete fails
+      }
+      
+      // Delete from database
+      const success = await storage.deleteVideo(id);
+      
+      if (success) {
+        res.status(204).end();
+      } else {
+        res.status(500).json({ message: "Failed to delete video from database" });
+      }
+    } catch (error) {
+      console.error("Error deleting video:", error);
+      res.status(500).json({ message: "Failed to delete video" });
+    }
+  });
+
+  // Comment endpoints
+  app.get("/api/videos/:id/comments", async (req: Request, res: Response) => {
+    try {
+      const videoId = parseInt(req.params.id);
+      const comments = await storage.getComments(videoId);
+      res.json(comments);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch comments" });
+    }
+  });
+
+  app.post("/api/videos/:id/comments", async (req: Request, res: Response) => {
+    try {
+      const videoId = parseInt(req.params.id);
+      
+      // Validate video exists
+      const video = await storage.getVideo(videoId);
+      if (!video) {
+        return res.status(404).json({ message: "Video not found" });
+      }
+      
+      // Validate comment data
+      const validatedData = insertCommentSchema.parse({
+        content: req.body.content,
+        videoId: videoId,
+        userId: 1 // Default to demo user for now (in a real app, would be from auth)
+      });
+      
+      const comment = await storage.createComment(validatedData);
+      res.status(201).json(comment);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        const validationError = fromZodError(error);
+        return res.status(400).json({ message: validationError.message });
+      }
+      
+      res.status(500).json({ message: "Failed to create comment" });
+    }
+  });
+
+  // Local file access proxy - handles access to files from different locations
+  app.get("/api/file/proxy", async (req: Request, res: Response) => {
+    try {
+      const key = req.query.key as string;
+      const type = req.query.type as string;
+      
+      if (!key) {
+        return res.status(400).json({ message: "Missing key parameter" });
+      }
+      
+      // Decode the key to handle special characters
+      const decodedKey = decodeURIComponent(key);
+      console.log(`File proxy request for: ${decodedKey}, type: ${type}`);
+      
+      // Determine appropriate path based on file type
+      let filePath;
+      if (type === 'thumbnail') {
+        filePath = path.join(thumbnailDir, path.basename(decodedKey));
+      } else {
+        filePath = path.join(uploadDir, path.basename(decodedKey));
+      }
+      
+      if (fs.existsSync(filePath)) {
+        // Set appropriate content type based on file extension
+        if (type === 'thumbnail' || decodedKey.endsWith('.jpg') || decodedKey.endsWith('.jpeg')) {
+          res.setHeader('Content-Type', 'image/jpeg');
+        } else if (decodedKey.endsWith('.png')) {
+          res.setHeader('Content-Type', 'image/png');
+        } else if (decodedKey.endsWith('.mp4')) {
+          res.setHeader('Content-Type', 'video/mp4');
+        } else {
+          res.setHeader('Content-Type', 'application/octet-stream');
+        }
+        
+        return res.sendFile(filePath);
+      }
+      
+      console.log('File not found at path:', filePath);
+      res.status(404).json({ message: "File not found" });
+    } catch (error) {
+      console.error("Error in file proxy:", error);
+      res.status(500).json({ message: "Failed to proxy file" });
+    }
+  });
+
+  // Set up static file serving for the uploads directory directly
+  app.use('/videos', express.static(path.join(process.cwd(), 'uploads'), {
+    setHeaders: (res, filePath) => {
+      // Set appropriate headers for video files
+      if (filePath.endsWith('.mp4') || filePath.endsWith('.MP4')) {
+        res.setHeader('Content-Type', 'video/mp4');
+      } else if (filePath.endsWith('.mov') || filePath.endsWith('.MOV')) {
+        res.setHeader('Content-Type', 'video/quicktime');
+      } else if (filePath.endsWith('.webm')) {
+        res.setHeader('Content-Type', 'video/webm');
+      }
+      res.setHeader('Accept-Ranges', 'bytes');
+    }
+  }));
+  
+  // Video streaming endpoint
+  app.get("/api/videos/stream", (req: Request, res: Response) => {
+    try {
+      const key = req.query.key as string;
+      
+      if (!key) {
+        console.log('Missing key parameter in request');
+        return res.status(400).json({ message: "Missing key parameter" });
+      }
+      
+      console.log(`==== STREAM REQUEST for: ${key} ====`);
+      
+      // Test specific file
+      const testFile = '644aa265-6e37-4ace-8fe7-e9df30739b86.mp4';
+      const testPath = path.join(process.cwd(), 'uploads', testFile);
+      console.log(`Specific test file exists: ${fs.existsSync(testPath)}`);
+      
+      // File path to check
+      const uploadDir = path.join(process.cwd(), 'uploads');
+      const filePath = path.join(uploadDir, key);
+      
+      // Get directory contents
+      try {
+        const files = fs.readdirSync(uploadDir);
+        console.log(`Found ${files.length} files in uploads directory`);
+        console.log(`First 5 files: ${files.slice(0, 5).join(', ')}`);
+        
+        // Check if file exists in directory
+        if (!files.includes(key)) {
+          console.log(`File ${key} not found in directory listing`);
+          return res.status(404).json({ 
+            message: "Video not found", 
+            requested: key,
+            availableFiles: files.slice(0, 5) 
+          });
+        }
+        
+        // Check file readability
+        try {
+          fs.accessSync(filePath, fs.constants.R_OK);
+          console.log(`File ${key} is readable`);
+          
+          // Send the file
+          console.log(`Sending file: ${filePath}`);
+          return res.sendFile(filePath);
+          
+        } catch (accessErr) {
+          console.error('File access error:', accessErr);
+          return res.status(403).json({ 
+            message: "Cannot read video file", 
+            error: accessErr instanceof Error ? accessErr.message : String(accessErr)
+          });
+        }
+        
+      } catch (dirErr) {
+        console.error('Error reading directory:', dirErr);
+        return res.status(500).json({
+          message: "Error reading uploads directory",
+          error: dirErr instanceof Error ? dirErr.message : String(dirErr)
+        });
+      }
+      
+    } catch (error) {
+      console.error("Error handling stream request:", error);
+      return res.status(500).json({ 
+        message: "Failed to process streaming request", 
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
+  
+  // We already set up static file serving at the top of the function
+  const httpServer = createServer(app);
+  return httpServer;
+}
